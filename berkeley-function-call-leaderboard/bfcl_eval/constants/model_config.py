@@ -2,7 +2,7 @@ from dataclasses import dataclass
 from typing import Optional
 
 from bfcl_eval.model_handler.api_inference.claude import ClaudeHandler
-from bfcl_eval.model_handler.api_inference.codex import CodexHandler, CodexFileHandler
+from bfcl_eval.model_handler.api_inference.codex import CodexHandler, CodexStdoutJsonHandler, CodexWriteFileHandler
 from bfcl_eval.model_handler.api_inference.cohere import CohereHandler
 from bfcl_eval.model_handler.api_inference.deepseek import DeepSeekAPIHandler
 from bfcl_eval.model_handler.api_inference.dm_cito import DMCitoHandler
@@ -1215,7 +1215,7 @@ api_inference_model_map = {
         url="https://github.com/openai/codex",
         org="OpenAI",
         license="Proprietary",
-        model_handler=CodexFileHandler,
+        model_handler=CodexStdoutJsonHandler,
         input_price=0.15,
         output_price=0.6,
         is_fc_model=False,
@@ -1227,7 +1227,7 @@ api_inference_model_map = {
         url="https://github.com/openai/codex",
         org="OpenAI",
         license="Proprietary",
-        model_handler=CodexFileHandler,
+        model_handler=CodexStdoutJsonHandler,
         input_price=2.5,
         output_price=10.0,
         is_fc_model=False,
@@ -1239,9 +1239,34 @@ api_inference_model_map = {
         url="https://github.com/openai/codex",
         org="OpenAI",
         license="Proprietary",
-        model_handler=CodexFileHandler,
+        model_handler=CodexStdoutJsonHandler,
         input_price=0.4,
         output_price=1.6,
+        is_fc_model=False,
+        underscore_to_dot=False,
+    ),
+    # WriteFile handlers - Debug version that truly writes files like Harbor
+    "codex-writefile-gpt-5-mini": ModelConfig(
+        model_name="gpt-5-mini",
+        display_name="Codex-WriteFile (gpt-5-mini)",
+        url="https://github.com/openai/codex",
+        org="OpenAI",
+        license="Proprietary",
+        model_handler=CodexWriteFileHandler,
+        input_price=0.4,
+        output_price=1.6,
+        is_fc_model=False,
+        underscore_to_dot=False,
+    ),
+    "codex-writefile-gpt-4o-mini": ModelConfig(
+        model_name="gpt-4o-mini",
+        display_name="Codex-WriteFile (gpt-4o-mini)",
+        url="https://github.com/openai/codex",
+        org="OpenAI",
+        license="Proprietary",
+        model_handler=CodexWriteFileHandler,
+        input_price=0.15,
+        output_price=0.6,
         is_fc_model=False,
         underscore_to_dot=False,
     ),

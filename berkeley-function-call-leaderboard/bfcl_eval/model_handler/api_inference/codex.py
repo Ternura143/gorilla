@@ -1,13 +1,15 @@
 """
-Codex handler for BFCL evaluation.
+Codex handlers for BFCL evaluation.
 
-This handler uses OpenAI's Codex CLI tool to solve function calling tasks.
-It operates in prompting mode, constructing prompts that include function definitions
-and expecting the model to output function calls in Python format.
+This module provides three implementations for evaluating function calling with Codex CLI:
 
-Two implementations:
-1. CodexHandler - Direct text parsing (original approach)
-2. CodexFileHandler - File-based approach (similar to Harbor's EvoEval adapter)
+1. CodexHandler - Outputs Python format directly (e.g., [func(a=1)])
+2. CodexStdoutJsonHandler - Outputs JSON to stdout (e.g., [{"func": {"a": 1}}])
+3. CodexWriteFileHandler - Writes JSON to file using shell commands
+
+Recommended:
+- gpt-5-mini: Use CodexWriteFileHandler (82% accuracy, best Harbor parity)
+- gpt-4o-mini: Use CodexStdoutJsonHandler (78% accuracy)
 """
 
 import json
@@ -32,11 +34,12 @@ from bfcl_eval.model_handler.utils import (
 
 class CodexHandler(BaseHandler):
     """
-    Handler for OpenAI Codex CLI integration with BFCL.
+    Codex handler that outputs function calls in Python format to stdout.
     
-    Codex is a coding agent that can execute shell commands and write code.
-    This handler bridges BFCL's function calling evaluation with Codex's capabilities
-    by constructing prompts that describe the available functions and expected output format.
+    Instructs Codex to directly output Python list format: [func(param="value")]
+    This is the original implementation with lowest accuracy (~65% for gpt-5-mini).
+    
+    Usage: codex-gpt-5-mini, codex-gpt-4o-mini
     """
 
     def __init__(
@@ -393,18 +396,15 @@ Do not include any explanation, just output the function call(s) as a Python lis
         return inference_data
 
 
-class CodexFileHandler(BaseHandler):
+class CodexStdoutJsonHandler(BaseHandler):
     """
-    File-based Codex handler for BFCL evaluation.
+    Codex handler that outputs JSON format to stdout (no file writing).
     
-    This handler is similar to Harbor's EvoEval adapter approach:
-    - Instructs Codex to execute shell commands to write function calls to a file
-    - Reads the result file to get the function call output
-    - This approach is closer to how Harbor evaluates agents
+    Instructs Codex to output JSON array to stdout: [{"func": {"param": "value"}}]
+    Provides moderate accuracy (~79% for gpt-5-mini, ~78% for gpt-4o-mini).
+    Works reliably for both models.
     
-    Comparison with CodexHandler:
-    - CodexHandler: Codex outputs text → parse text
-    - CodexFileHandler: Codex writes file → read file → parse content
+    Usage: codex-file-gpt-5-mini, codex-file-gpt-4o-mini
     """
 
     def __init__(
@@ -726,3 +726,256 @@ IMPORTANT: Output ONLY the JSON array, nothing else."""
         )
         return inference_data
 
+
+
+class CodexWriteFileHandler(BaseHandler):
+    """
+    Codex handler that writes JSON to file using shell commands (mimics Harbor).
+    
+    Instructs Codex to execute shell commands to write result.json to disk,
+    then reads the file. Uses absolute file paths for reliability.
+    
+    Best performance for gpt-5-mini (~82%, achieves parity with Harbor).
+    Fails for gpt-4o-mini (~32%) due to incorrect shell command construction.
+    
+    Usage: codex-writefile-gpt-5-mini (recommended), codex-writefile-gpt-4o-mini (not recommended)
+    """
+
+    def __init__(
+        self,
+        model_name: str,
+        temperature: float,
+        registry_name: str,
+        is_fc_model: bool,
+        **kwargs,
+    ) -> None:
+        super().__init__(model_name, temperature, registry_name, is_fc_model, **kwargs)
+        self.model_style = ModelStyle.OSSMODEL
+        self._verify_codex_installation()
+    
+    def _verify_codex_installation(self) -> None:
+        try:
+            result = subprocess.run(["codex", "--version"], capture_output=True, text=True, timeout=10)
+            if result.returncode != 0:
+                print(f"Warning: codex CLI returned non-zero exit code: {result.returncode}")
+        except FileNotFoundError:
+            raise RuntimeError("Codex CLI is not installed. Please install it with: npm install -g @openai/codex")
+        except subprocess.TimeoutExpired:
+            print("Warning: codex version check timed out")
+
+    def _build_write_file_prompt(self, system_prompt: str, user_message: str, result_file_path: str) -> str:
+        """Build a prompt that instructs Codex to write result to a file (like Harbor)."""
+        return f"""# Task
+
+{user_message}
+
+## Available Functions
+
+{system_prompt}
+
+## Output
+
+Analyze the request and determine the appropriate function call(s). 
+Write ONLY a JSON array to \`{result_file_path}\`.
+
+Format:
+- If a function applies: \`[{{"function_name": {{"param1": "value1"}}}}]\`
+- If no function applies: \`[]\`
+
+Example:
+\`\`\`bash
+echo '[{{"get_weather": {{"city": "NYC"}}}}]' > {result_file_path}
+\`\`\`
+
+IMPORTANT: You MUST execute the command to write the file."""
+
+    def _run_codex_write_file(self, prompt: str, work_dir: Path, result_file: Path) -> dict:
+        """Execute Codex CLI and check if it writes the result file."""
+        model = self.model_name.split("/")[-1] if "/" in self.model_name else self.model_name
+        
+        cmd = ["codex", "exec", "--dangerously-bypass-approvals-and-sandbox", "--skip-git-repo-check",
+               "--model", model, "--json", "--", prompt]
+        
+        start_time = time.time()
+        debug_info = {
+            "work_dir": str(work_dir), "result_file_path": str(result_file),
+            "commands_executed": [], "file_created": False, "file_content": None,
+            "codex_stdout": "", "codex_stderr": "", "exit_code": None, "error": None,
+        }
+        
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=300, cwd=work_dir,
+                                    env={**os.environ, "OPENAI_API_KEY": os.environ.get("OPENAI_API_KEY", "")})
+            
+            debug_info["latency"] = time.time() - start_time
+            debug_info["exit_code"] = result.returncode
+            debug_info["codex_stdout"] = result.stdout
+            debug_info["codex_stderr"] = result.stderr
+            
+            # Parse executed commands from Codex output
+            for line in result.stdout.strip().split('\n'):
+                if not line.strip():
+                    continue
+                try:
+                    event = json.loads(line)
+                    if event.get("type") == "item.completed":
+                        item = event.get("item", {})
+                        if item.get("type") == "command_execution":
+                            debug_info["commands_executed"].append({
+                                "command": item.get("command", ""),
+                                "exit_code": item.get("exit_code"),
+                                "output": item.get("aggregated_output", ""),
+                                "status": item.get("status", ""),
+                            })
+                        elif item.get("type") == "agent_message":
+                            debug_info["agent_message"] = item.get("text", "")
+                except json.JSONDecodeError:
+                    continue
+            
+            # Check if result file was created
+            if result_file.exists():
+                debug_info["file_created"] = True
+                debug_info["file_content"] = result_file.read_text()
+            else:
+                alt_path = work_dir / "result.json"
+                if alt_path.exists():
+                    debug_info["file_created"] = True
+                    debug_info["file_content"] = alt_path.read_text()
+                    debug_info["file_found_at"] = str(alt_path)
+                else:
+                    debug_info["files_in_work_dir"] = [f.name for f in work_dir.iterdir()]
+                    
+        except subprocess.TimeoutExpired:
+            debug_info["latency"] = time.time() - start_time
+            debug_info["error"] = "Codex execution timed out"
+        except Exception as e:
+            debug_info["latency"] = time.time() - start_time
+            debug_info["error"] = str(e)
+        
+        return debug_info
+
+    def _parse_file_content(self, content: str) -> str:
+        """Parse the JSON file content and convert to BFCL Python format."""
+        if not content or not content.strip():
+            return "[]"
+        try:
+            json_data = json.loads(content.strip())
+            if isinstance(json_data, list):
+                result = []
+                for call in json_data:
+                    if isinstance(call, dict) and len(call) == 1:
+                        func_name = list(call.keys())[0]
+                        params = call[func_name]
+                        if isinstance(params, dict):
+                            param_str = ", ".join([f"{k}={repr(v)}" for k, v in params.items()])
+                            result.append(f"{func_name}({param_str})")
+                        else:
+                            result.append(f"{func_name}()")
+                return "[" + ", ".join(result) + "]"
+            return "[]"
+        except json.JSONDecodeError as e:
+            return f"[JSON_PARSE_ERROR: {e}]"
+
+    def _pre_query_processing_prompting(self, test_entry: dict) -> dict:
+        functions: list = test_entry["function"]
+        test_entry_id: str = test_entry["id"]
+        test_entry["question"][0] = system_prompt_pre_processing_chat_model(
+            test_entry["question"][0], functions, test_entry_id
+        )
+        return {"message": test_entry["question"], "function": functions}
+
+    def _parse_query_response_prompting(self, api_response: str) -> dict:
+        return {
+            "model_responses": api_response,
+            "model_responses_message_for_chat_history": [{"role": "assistant", "content": api_response}],
+            "input_token": 0, "output_token": 0,
+        }
+
+    def inference_single_turn_prompting(self, test_entry: dict, include_input_log: bool) -> tuple[any, dict]:
+        """Single-turn inference using true file-writing approach with debug output."""
+        inference_data = self._pre_query_processing_prompting(test_entry)
+        inference_data = self.add_first_turn_message_prompting(inference_data, test_entry["question"][0])
+        
+        messages = inference_data.get("message", [])
+        system_prompt, user_message = "", ""
+        for msg in messages:
+            if isinstance(msg, dict):
+                if msg.get("role") == "system":
+                    system_prompt = msg.get("content", "")
+                elif msg.get("role") == "user":
+                    user_message = msg.get("content", "")
+        
+        with tempfile.TemporaryDirectory() as temp_dir:
+            work_dir = Path(temp_dir)
+            result_file = work_dir / "result.json"
+            
+            prompt = self._build_write_file_prompt(system_prompt, user_message, str(result_file))
+            debug_info = self._run_codex_write_file(prompt, work_dir, result_file)
+            
+            # Print debug info
+            print(f"\n{'='*60}")
+            print(f"DEBUG: Task {test_entry.get('id', 'unknown')}")
+            print(f"{'='*60}")
+            print(f"Work dir: {debug_info['work_dir']}")
+            print(f"Result file path: {debug_info['result_file_path']}")
+            print(f"Exit code: {debug_info['exit_code']}")
+            print(f"File created: {debug_info['file_created']}")
+            
+            if debug_info['commands_executed']:
+                print(f"\nCommands executed ({len(debug_info['commands_executed'])}):")
+                for i, cmd in enumerate(debug_info['commands_executed']):
+                    print(f"  [{i+1}] {cmd['command'][:100]}...")
+                    print(f"      status: {cmd['status']}, exit: {cmd['exit_code']}")
+            else:
+                print("\nNo commands executed by Codex!")
+                if debug_info.get('agent_message'):
+                    print(f"Agent message: {debug_info['agent_message'][:200]}...")
+            
+            if debug_info['file_created']:
+                print(f"\nFile content: {debug_info['file_content'][:200] if debug_info['file_content'] else 'empty'}")
+            else:
+                print(f"\nFiles in work_dir: {debug_info.get('files_in_work_dir', [])}")
+            
+            if debug_info.get('error'):
+                print(f"\nError: {debug_info['error']}")
+            print(f"{'='*60}\n")
+            
+            if debug_info['file_created'] and debug_info['file_content']:
+                api_response = self._parse_file_content(debug_info['file_content'])
+            else:
+                api_response = "[]"
+        
+        model_response_data = self._parse_query_response_prompting(api_response)
+        
+        metadata = {}
+        if include_input_log:
+            metadata["inference_log"] = [{"role": "inference_input", "content": inference_data.get("inference_input_log", "")}]
+            metadata["debug_info"] = debug_info
+        metadata["input_token_count"] = model_response_data["input_token"]
+        metadata["output_token_count"] = model_response_data["output_token"]
+        metadata["latency"] = debug_info.get("latency", 0)
+        
+        return model_response_data["model_responses"], metadata
+
+    def decode_ast(self, result, language, has_tool_call_tag):
+        return default_decode_ast_prompting(result, language, has_tool_call_tag)
+
+    def decode_execute(self, result, has_tool_call_tag):
+        return default_decode_execute_prompting(result, has_tool_call_tag)
+
+    def add_first_turn_message_prompting(self, inference_data: dict, first_turn_message: list[dict]) -> dict:
+        inference_data["message"].extend(first_turn_message)
+        return inference_data
+
+    def _add_next_turn_user_message_prompting(self, inference_data: dict, user_message: list[dict]) -> dict:
+        inference_data["message"].extend(user_message)
+        return inference_data
+
+    def _add_assistant_message_prompting(self, inference_data: dict, model_response_data: dict) -> dict:
+        inference_data["message"].extend(model_response_data["model_responses_message_for_chat_history"])
+        return inference_data
+
+    def _add_execution_results_prompting(self, inference_data: dict, execution_results: list[str], model_response_data: dict) -> dict:
+        formatted_results_message = format_execution_results_prompting(inference_data, execution_results, model_response_data)
+        inference_data["message"].append({"role": "user", "content": formatted_results_message})
+        return inference_data
