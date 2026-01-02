@@ -111,6 +111,7 @@ Do not include any explanation, just output the function call(s) as a Python lis
         
         # Build the codex command
         # Using exec mode with bypass flags for automation
+        # Note: Codex CLI does not support --temperature flag
         cmd = [
             "codex", "exec",
             "--dangerously-bypass-approvals-and-sandbox",
@@ -441,53 +442,50 @@ class CodexFileHandler(BaseHandler):
 
     def _build_codex_file_prompt(self, system_prompt: str, user_message: str) -> str:
         """
-        Build a prompt for Codex that instructs it to write function calls to a file.
+        Build a prompt for Codex to output JSON format directly to stdout.
         
-        This is similar to Harbor's instruction.md approach:
-        - Analyze the request and function definitions
-        - Execute shell command to write result.json
+        This avoids file path issues and simplifies the evaluation process.
         """
-        prompt = f"""You are a function calling assistant. Analyze the user's request and determine the appropriate function call(s).
+        prompt = f"""# Task
+
+{user_message}
+
+## Available Functions
 
 {system_prompt}
 
-User Request: {user_message}
+## Output
 
-## Task
+Analyze the request and determine the appropriate function call(s). Output ONLY a JSON array.
 
-Write your answer as a JSON array to result.json in the current directory.
-
+Format:
 - If a function applies: [{{"function_name": {{"param1": "value1"}}}}]
 - If no function applies: []
 
-Use sh -c to execute the command. For example:
+Example output:
+[{{"get_weather": {{"city": "NYC"}}}}]
 
-```bash
-sh -c 'echo "[{{\\"get_weather\\": {{\\"city\\": \\"NYC\\"}}}}]" > result.json'
-```
-
-Important: Always use sh -c to execute shell commands."""
+IMPORTANT: Output ONLY the JSON array, nothing else."""
         
         return prompt
 
     def _run_codex_with_file(self, prompt: str, work_dir: Path) -> tuple[str, float]:
         """
-        Execute Codex CLI with the given prompt in a working directory.
+        Execute Codex CLI and parse JSON output from stdout.
+        
+        Parses JSON directly from stdout without file dependency for reliability.
         
         Args:
             prompt: The prompt to send to Codex
-            work_dir: Working directory where result.json should be written
+            work_dir: Working directory (not used in this implementation)
         
         Returns:
-            tuple: (result_json_content, latency_seconds)
+            tuple: (json_output, latency_seconds)
         """
         # Get the model name (strip provider prefix if present)
         model = self.model_name
         if "/" in model:
             model = model.split("/")[-1]
-        
-        # Escape the prompt for shell
-        escaped_prompt = shlex.quote(prompt)
         
         # Construct codex command
         cmd = [
@@ -498,31 +496,25 @@ Important: Always use sh -c to execute shell commands."""
             "--model", model,
             "--json",
             "--",
-            escaped_prompt
+            prompt,
         ]
         
         start_time = time.time()
         
         try:
-            # Run codex in the working directory
+            # Run codex
             result = subprocess.run(
                 cmd,
                 capture_output=True,
                 text=True,
-                timeout=300,  # 5 minute timeout
-                cwd=work_dir,
+                timeout=300,
                 env={**os.environ, "OPENAI_API_KEY": os.environ.get("OPENAI_API_KEY", "")},
             )
             
             latency = time.time() - start_time
             
-            # Check if result.json was created
-            result_file = work_dir / "result.json"
-            if result_file.exists():
-                return result_file.read_text(), latency
-            else:
-                # Codex didn't write the file, return error
-                return json.dumps({"error": "result.json not found", "output": result.stdout}), latency
+            # Parse JSON directly from stdout (no file needed)
+            return result.stdout, latency
                 
         except subprocess.TimeoutExpired:
             latency = time.time() - start_time
@@ -533,49 +525,66 @@ Important: Always use sh -c to execute shell commands."""
 
     def _parse_result_file(self, content: str) -> str:
         """
-        Parse the result.json content to extract function calls.
+        Parse Codex stdout to extract JSON function calls and convert to BFCL format.
+        
+        Extracts JSON from stdout events and converts to Python function call format.
         
         Args:
-            content: JSON content from result.json
+            content: Codex stdout (containing JSON events)
         
         Returns:
             String representation of function calls in BFCL format (e.g., "[func1(), func2()]")
         """
-        try:
-            # Try to parse as JSON
-            data = json.loads(content)
+        # First, try to extract JSON from Codex's stdout
+        # Codex outputs JSON events line by line
+        json_output = None
+        
+        for line in content.strip().split('\n'):
+            if not line.strip():
+                continue
             
-            # If it's an error dict, return empty string
-            if isinstance(data, dict) and "error" in data:
-                print(f"Codex file handler error: {data['error']}")
-                return "[]"
-            
-            # If it's already a list of function calls, convert to string format
-            if isinstance(data, list):
-                # Convert from Harbor format to BFCL format
-                # Harbor: [{"function_name": {"param": "value"}}]
-                # BFCL string: "[function_name(param='value')]"
-                result = []
-                for call in data:
-                    if isinstance(call, dict) and len(call) == 1:
-                        func_name = list(call.keys())[0]
-                        params = call[func_name]
-                        # Convert to Python function call string
-                        if isinstance(params, dict):
-                            param_str = ", ".join([f"{k}={repr(v)}" for k, v in params.items()])
-                            result.append(f"{func_name}({param_str})")
-                        else:
-                            result.append(f"{func_name}()")
-                
-                # Return as string representation of list
-                return "[" + ", ".join(result) + "]"
-            
+            try:
+                event = json.loads(line)
+                # Look for agent_message with JSON content
+                if event.get("type") == "item.completed":
+                    item = event.get("item", {})
+                    if item.get("type") == "agent_message":
+                        text = item.get("text", "")
+                        # Try to extract JSON array from text
+                        # Look for pattern like [{...}]
+                        import re
+                        match = re.search(r'\[.*?\]', text, re.DOTALL)
+                        if match:
+                            json_str = match.group(0)
+                            try:
+                                json_output = json.loads(json_str)
+                                break
+                            except:
+                                continue
+            except json.JSONDecodeError:
+                continue
+        
+        if json_output is None:
             return "[]"
+        
+        # Convert from JSON format to BFCL Python format
+        # JSON: [{"function_name": {"param": "value"}}]
+        # BFCL: "[function_name(param='value')]"
+        if isinstance(json_output, list):
+            result = []
+            for call in json_output:
+                if isinstance(call, dict) and len(call) == 1:
+                    func_name = list(call.keys())[0]
+                    params = call[func_name]
+                    if isinstance(params, dict):
+                        param_str = ", ".join([f"{k}={repr(v)}" for k, v in params.items()])
+                        result.append(f"{func_name}({param_str})")
+                    else:
+                        result.append(f"{func_name}()")
             
-        except json.JSONDecodeError as e:
-            print(f"Failed to parse result.json: {e}")
-            print(f"Content: {content[:200]}...")
-            return "[]"
+            return "[" + ", ".join(result) + "]"
+        
+        return "[]"
 
     def _pre_query_processing_prompting(self, test_entry: dict) -> dict:
         """
