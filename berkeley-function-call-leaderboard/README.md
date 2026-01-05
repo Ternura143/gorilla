@@ -332,79 +332,154 @@ This fork includes modifications to support parity validation experiments for th
 
 ### What We Modified
 
-We extended BFCL's evaluation framework to support three different Codex handler modes, enabling comparison between Harbor's file-based output approach and BFCL's original output handling methods:
+We implemented **three Codex handler classes** in `bfcl_eval/model_handler/api_inference/codex.py` to enable comparison between Harbor's file-based output approach and different output handling methods:
 
-1. **CodexWriteFileHandler** (Primary Parity)
-   - Model writes function call output to a file (`/app/result.json`)
-   - Most comparable to Harbor's approach
-   - Used as the primary parity baseline
+#### 1. CodexHandler (Python Stdout)
+**File:** `bfcl_eval/model_handler/api_inference/codex.py` (class `CodexHandler`)  
+**Model Names:** `codex-gpt-5-mini`, `codex-gpt-4o-mini`
 
-2. **CodexHandler** (Additional Experiment)
-   - Model outputs Python format to stdout
-   - Original BFCL handler for Codex models
-   - Demonstrates impact of stdout-based output parsing
+- Instructs Codex CLI to output Python list format directly: `[func(param="value")]`
+- Parses stdout for Python function call syntax
+- Original baseline implementation
 
-3. **CodexStdoutJsonHandler** (Additional Experiment)
-   - Model outputs JSON format to stdout
-   - Alternative stdout-based approach
-   - Shows how output format affects evaluation
 
-### Why Three Handlers?
+#### 2. CodexStdoutJsonHandler (JSON Stdout)
+**File:** `bfcl_eval/model_handler/api_inference/codex.py` (class `CodexStdoutJsonHandler`)  
+**Model Names:** `codex-file-gpt-5-mini`, `codex-file-gpt-4o-mini`
 
-The parity experiments aim to validate that Harbor's adapter produces equivalent results to BFCL. However, Harbor uses file-based output (`/app/result.json`) while BFCL's original Codex handler uses stdout. By testing all three modes, we can:
+- Instructs Codex to output JSON array to stdout: `[{"func": {"param": "value"}}]`
+- Parses JSON from stdout and converts to BFCL Python format
+- More structured than Python stdout
 
-- Demonstrate that Harbor's approach (file-based) matches BFCL's `CodexWriteFileHandler`
-- Quantify how output format (file vs stdout, Python vs JSON) impacts evaluation accuracy
-- Validate that differences are due to output handling, not adapter implementation errors
 
-### Running Parity Experiments
+#### 3. CodexWriteFileHandler (File Output - Harbor Parity)
+**File:** `bfcl_eval/model_handler/api_inference/codex.py` (class `CodexWriteFileHandler`)  
+**Model Names:** `codex-writefile-gpt-5-mini`, `codex-writefile-gpt-4o-mini`
 
-**Setup:**
+- Instructs Codex to write JSON to file using shell commands: `echo '[...]' > result.json`
+- Reads the file after execution (mimics Harbor's `/app/result.json` approach)
+- Most comparable to Harbor adapter
+
+
+### Prerequisites
+
+**Required:**
+- Codex CLI installed: `npm install -g @openai/codex`
+- OpenAI API key: `export OPENAI_API_KEY=your-key`
+- Python 3.10: `conda create -n BFCL python=3.10`
+
+**This fork:**
 ```bash
-conda create -n BFCL python=3.10
-conda activate BFCL
 git clone https://github.com/Ternura143/gorilla.git
 cd gorilla/berkeley-function-call-leaderboard
 pip install -e .
 ```
 
-**Run evaluation with specific handler:**
+### Running Parity Experiments
+
+#### Step 1: Prepare Task IDs
+
+The parity sample uses 123 stratified tasks. The task IDs are synced with Harbor's `parity_sample_source_ids.txt` to ensure consistency.
+
+**Option 1: Use existing file (recommended)**
 ```bash
-# Modify handler_map.py or model_config.py to select handler mode
-# Then run evaluation
-python openfunctions_evaluation.py \
-  --model gpt-5-mini \
-  --test-category all \
-  --num-threads 10
+# The committed test_case_ids_to_generate.json already has 123 parity IDs
+# No action needed
 ```
 
-**Calculate parity task accuracy:**
+**Option 2: Regenerate from Harbor source**
+```bash
+# Automatically downloads from Harbor main branch and generates the file
+python generate_test_ids_from_harbor.py
+```
 
-The parity sample uses 123 stratified tasks from `parity_sample_source_ids.txt`. To calculate accuracy:
+This ensures the exact same 123 tasks are used in both BFCL and Harbor evaluations.
 
-1. Run evaluation to generate `score/<model>/*/BFCL_v4_*_score.json`
-2. BFCL score files only record failed tasks (Line 1 = summary, Line 2+ = failures)
-3. Calculate: `accuracy = (total_parity_tasks - failed_parity_tasks) / total_parity_tasks`
+#### Step 2: Generate Responses
+
+Run evaluation for each handler mode:
+
+```bash
+# CodexHandler (Python stdout)
+bfcl generate --model codex-gpt-5-mini --run-ids
+
+# CodexStdoutJsonHandler (JSON stdout)
+bfcl generate --model codex-file-gpt-5-mini --run-ids
+
+# CodexWriteFileHandler (file output - Harbor parity)
+bfcl generate --model codex-writefile-gpt-5-mini --run-ids
+```
+
+**Note:** Using `--run-ids` tells BFCL to only evaluate the 123 tasks listed in `test_case_ids_to_generate.json`.
+
+#### Step 3: Evaluate Responses
+
+```bash
+# Evaluate with partial-eval flag (since we only ran 123 tasks, not all)
+bfcl evaluate --model codex-gpt-5-mini --test-category all --partial-eval
+bfcl evaluate --model codex-file-gpt-5-mini --test-category all --partial-eval
+bfcl evaluate --model codex-writefile-gpt-5-mini --test-category all --partial-eval
+```
+
+#### Step 4: Calculate Parity Accuracy
+
+BFCL score files (`score/<model>/*/BFCL_v4_*_score.json`) have a special format:
+- **Line 1:** Summary statistics for all tasks in that category
+- **Line 2+:** Only failed tasks (successful tasks are not recorded)
+
+To calculate accuracy for the 123 parity tasks:
+1. Load all score files for the 13 categories
+2. Extract failed task IDs from each file
+3. Filter for the 123 parity task IDs
+4. Calculate: `accuracy = (123 - failed_count) / 123`
 
 ### Parity Results
 
-Tested on 123 stratified sampled tasks with 3 runs each:
+Tested on 123 stratified sampled tasks (3.4% of 3,641 total) with 3 runs each:
 
-| Handler | Model | Accuracy | Std |
-|---------|-------|----------|-----|
-| CodexWriteFileHandler | gpt-5-mini | 82.11% | 0.82% |
-| CodexWriteFileHandler | gpt-4o-mini | 32.79% | 1.24% |
-| CodexHandler | gpt-5-mini | 62.33% | 8.22% |
-| CodexHandler | gpt-4o-mini | 75.07% | 3.67% |
-| CodexStdoutJsonHandler | gpt-5-mini | 70.46% | 5.41% |
-| CodexStdoutJsonHandler | gpt-4o-mini | 72.36% | 3.73% |
+| Handler | Model | Accuracy | Std | Registry Name |
+|---------|-------|----------|-----|---------------|
+| CodexWriteFileHandler (Parity) | gpt-5-mini | 82.11% | 0.82% | `codex-writefile-gpt-5-mini` |
+| CodexWriteFileHandler (Parity) | gpt-4o-mini | 32.79% | 1.24% | `codex-writefile-gpt-4o-mini` |
+| CodexHandler (Additional) | gpt-5-mini | 62.33% | 8.22% | `codex-gpt-5-mini` |
+| CodexHandler (Additional) | gpt-4o-mini | 75.07% | 3.67% | `codex-gpt-4o-mini` |
+| CodexStdoutJsonHandler (Additional) | gpt-5-mini | 70.46% | 5.41% | `codex-file-gpt-5-mini` |
+| CodexStdoutJsonHandler (Additional) | gpt-4o-mini | 72.36% | 3.73% | `codex-file-gpt-4o-mini` |
 
-**Key Findings:**
-- File-based output (`CodexWriteFileHandler`) shows lower variance and more consistent results
-- Output format significantly impacts evaluation accuracy
-- Harbor adapter achieves <1% parity gap with `CodexWriteFileHandler` for gpt-5-mini
+**Harbor Adapter Results (for comparison):**
+- gpt-5-mini: 81.57% ± 0.47% (difference from WriteFile: -0.54%)
+- gpt-4o-mini: 22.49% ± 2.48%
 
-For Harbor adapter details, see: https://github.com/laude-institute/harbor/tree/main/adapters/bfcl
+### Key Findings
+
+1. **Output format matters:** File-based output (CodexWriteFileHandler) shows lower variance and better reliability for gpt-5-mini
+2. **Model sensitivity:** gpt-4o-mini shows inconsistent behavior across handlers (likely due to instruction following differences)
+3. **Parity validated:** Harbor adapter achieves <1% accuracy gap with CodexWriteFileHandler for gpt-5-mini, confirming evaluation equivalence
+4. **Format impact:** Different output formats (Python vs JSON, stdout vs file) can cause 10-20% accuracy swings
+
+### Implementation Details
+
+All three handlers are located in:
+```
+bfcl_eval/model_handler/api_inference/codex.py
+```
+
+Model configurations are registered in:
+```
+bfcl_eval/constants/model_config.py
+```
+
+Each handler:
+- Extends `BaseHandler` from `bfcl_eval/model_handler/base_handler.py`
+- Uses Codex CLI (`codex exec --model <model> --json --dangerously-bypass-approvals-and-sandbox`)
+- Requires `OPENAI_API_KEY` environment variable
+- Implements custom prompt construction and output parsing
+
+### Links
+
+- **Harbor Adapter:** https://github.com/laude-institute/harbor/tree/main/adapters/bfcl
+- **Harbor PR:** https://github.com/laude-institute/harbor/pull/358
+- **Parity Results:** https://github.com/laude-institute/harbor/blob/main/adapters/bfcl/parity_experiment.json
 
 ---
 
