@@ -5,11 +5,11 @@ This module provides three implementations for evaluating function calling with 
 
 1. CodexHandler - Outputs Python format directly (e.g., [func(a=1)])
 2. CodexStdoutJsonHandler - Outputs JSON to stdout (e.g., [{"func": {"a": 1}}])
-3. CodexWriteFileHandler - Writes JSON to file using shell commands
+3. CodexWriteFileHandler - Writes JSON to file using shell commands (Harbor parity)
 
-Recommended:
-- gpt-5-mini: Use CodexWriteFileHandler (82% accuracy, best Harbor parity)
-- gpt-4o-mini: Use CodexStdoutJsonHandler (78% accuracy)
+Recommended for Harbor parity:
+- gpt-5-mini: Use CodexWriteFileHandler (codex-writefile-gpt-5-mini)
+- gpt-4o-mini: Use CodexWriteFileHandler (codex-writefile-gpt-4o-mini)
 """
 
 import json
@@ -794,7 +794,11 @@ IMPORTANT: You MUST execute the command to write the file."""
         model = self.model_name.split("/")[-1] if "/" in self.model_name else self.model_name
         
         cmd = ["codex", "exec", "--dangerously-bypass-approvals-and-sandbox", "--skip-git-repo-check",
-               "--model", model, "--json", "--", prompt]
+               "--model", model, "--json", "--enable", "unified_exec"]
+        base_url = os.environ.get("OPENAI_BASE_URL", "")
+        if base_url:
+            cmd.extend(["-c", f'openai_base_url="{base_url}"'])
+        cmd.extend(["--", prompt])
         
         start_time = time.time()
         debug_info = {
